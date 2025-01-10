@@ -7,9 +7,9 @@ import (
 	"testing"
 
 	"github.com/distribution/distribution/v3"
+	"github.com/distribution/distribution/v3/internal/client/auth"
+	"github.com/distribution/distribution/v3/internal/client/auth/challenge"
 	"github.com/distribution/distribution/v3/manifest/schema2"
-	"github.com/distribution/distribution/v3/registry/client/auth"
-	"github.com/distribution/distribution/v3/registry/client/auth/challenge"
 	"github.com/distribution/distribution/v3/registry/proxy/scheduler"
 	"github.com/distribution/distribution/v3/registry/storage"
 	"github.com/distribution/distribution/v3/registry/storage/cache/memory"
@@ -17,6 +17,8 @@ import (
 	"github.com/distribution/distribution/v3/testutil"
 	"github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/specs-go"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 type statsManifest struct {
@@ -26,6 +28,7 @@ type statsManifest struct {
 
 type manifestStoreTestEnv struct {
 	manifestDigest digest.Digest // digest of the signed manifest in the local storage
+	manifestSize   uint64
 	manifests      proxyManifestStore
 }
 
@@ -98,16 +101,16 @@ func newManifestStoreTestEnv(t *testing.T, name, tag string) *manifestStoreTestE
 	}
 	tr, err := truthRepo.Manifests(ctx)
 	if err != nil {
-		t.Fatal(err.Error())
+		t.Fatal(err)
 	}
 	truthManifests := statsManifest{
 		manifests: tr,
 		stats:     make(map[string]int),
 	}
 
-	manifestDigest, err := populateRepo(ctx, t, truthRepo, name, tag)
+	manifestDigest, manifestSize, err := populateRepo(ctx, t, truthRepo, name, tag)
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
 	localRegistry, err := storage.NewRegistry(ctx, inmemory.New(),
@@ -121,7 +124,7 @@ func newManifestStoreTestEnv(t *testing.T, name, tag string) *manifestStoreTestE
 	}
 	lr, err := localRepo.Manifests(ctx, storage.SkipLayerVerification())
 	if err != nil {
-		t.Fatal(err.Error())
+		t.Fatal(err)
 	}
 
 	localManifests := statsManifest{
@@ -132,6 +135,7 @@ func newManifestStoreTestEnv(t *testing.T, name, tag string) *manifestStoreTestE
 	s := scheduler.New(ctx, inmemory.New(), "/scheduler-state.json")
 	return &manifestStoreTestEnv{
 		manifestDigest: manifestDigest,
+		manifestSize:   manifestSize,
 		manifests: proxyManifestStore{
 			ctx:             ctx,
 			localManifests:  localManifests,
@@ -143,7 +147,7 @@ func newManifestStoreTestEnv(t *testing.T, name, tag string) *manifestStoreTestE
 	}
 }
 
-func populateRepo(ctx context.Context, t *testing.T, repository distribution.Repository, name, tag string) (digest.Digest, error) {
+func populateRepo(ctx context.Context, t *testing.T, repository distribution.Repository, name, tag string) (manifestDigest digest.Digest, manifestSize uint64, _ error) {
 	config := []byte(`{"name": "foo"}`)
 	configDigest := digest.FromBytes(config)
 	configReader := bytes.NewReader(config)
@@ -153,8 +157,9 @@ func populateRepo(ctx context.Context, t *testing.T, repository distribution.Rep
 	}
 
 	m := schema2.Manifest{
-		Versioned: schema2.SchemaVersion,
-		Config: distribution.Descriptor{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: schema2.MediaTypeManifest,
+		Config: v1.Descriptor{
 			MediaType: "foo/bar",
 			Digest:    configDigest,
 		},
@@ -163,7 +168,7 @@ func populateRepo(ctx context.Context, t *testing.T, repository distribution.Rep
 	for i := 0; i < 2; i++ {
 		rs, dgst, err := testutil.CreateRandomTarFile()
 		if err != nil {
-			t.Fatalf("unexpected error generating test layer file")
+			t.Fatal("unexpected error generating test layer file")
 		}
 
 		if err := testutil.PushBlob(ctx, repository, rs, dgst); err != nil {
@@ -173,18 +178,23 @@ func populateRepo(ctx context.Context, t *testing.T, repository distribution.Rep
 
 	ms, err := repository.Manifests(ctx)
 	if err != nil {
-		t.Fatal(err.Error())
+		t.Fatal(err)
 	}
 	sm, err := schema2.FromStruct(m)
 	if err != nil {
-		t.Fatal(err.Error())
+		t.Fatal(err)
 	}
+	smJSON, err := sm.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	dgst, err := ms.Put(ctx, sm)
 	if err != nil {
 		t.Fatalf("unexpected errors putting manifest: %v", err)
 	}
 
-	return dgst, nil
+	return dgst, uint64(len(smJSON)), nil
 }
 
 // TestProxyManifests contains basic acceptance tests
@@ -200,7 +210,7 @@ func TestProxyManifests(t *testing.T) {
 	// Stat - must check local and remote
 	exists, err := env.manifests.Exists(ctx, env.manifestDigest)
 	if err != nil {
-		t.Fatalf("Error checking existence")
+		t.Fatal("Error checking existence")
 	}
 	if !exists {
 		t.Errorf("Unexpected non-existent manifest")
@@ -268,7 +278,7 @@ func TestProxyManifestsWithoutScheduler(t *testing.T) {
 	ctx := context.Background()
 	exists, err := env.manifests.Exists(ctx, env.manifestDigest)
 	if err != nil {
-		t.Fatalf("Error checking existence")
+		t.Fatal("Error checking existence")
 	}
 	if !exists {
 		t.Errorf("Unexpected non-existent manifest")
@@ -278,5 +288,56 @@ func TestProxyManifestsWithoutScheduler(t *testing.T) {
 	_, err = env.manifests.Get(ctx, env.manifestDigest)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProxyManifestsMetrics(t *testing.T) {
+	proxyMetrics = &proxyMetricsCollector{}
+	name := "foo/bar"
+	env := newManifestStoreTestEnv(t, name, "latest")
+
+	ctx := context.Background()
+	// Get - should succeed and pull manifest into local
+	_, err := env.manifests.Get(ctx, env.manifestDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if proxyMetrics.manifestMetrics.Requests != 1 {
+		t.Errorf("Expected manifestMetrics.Requests %d but got %d", 1, proxyMetrics.manifestMetrics.Requests)
+	}
+	if proxyMetrics.manifestMetrics.Hits != 0 {
+		t.Errorf("Expected manifestMetrics.Hits %d but got %d", 0, proxyMetrics.manifestMetrics.Hits)
+	}
+	if proxyMetrics.manifestMetrics.Misses != 1 {
+		t.Errorf("Expected manifestMetrics.Misses %d but got %d", 1, proxyMetrics.manifestMetrics.Misses)
+	}
+	if proxyMetrics.manifestMetrics.BytesPulled != env.manifestSize {
+		t.Errorf("Expected manifestMetrics.BytesPulled %d but got %d", env.manifestSize, proxyMetrics.manifestMetrics.BytesPulled)
+	}
+	if proxyMetrics.manifestMetrics.BytesPushed != env.manifestSize {
+		t.Errorf("Expected manifestMetrics.BytesPushed %d but got %d", env.manifestSize, proxyMetrics.manifestMetrics.BytesPushed)
+	}
+
+	// Get proxied - manifest comes from local
+	_, err = env.manifests.Get(ctx, env.manifestDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if proxyMetrics.manifestMetrics.Requests != 2 {
+		t.Errorf("Expected manifestMetrics.Requests %d but got %d", 2, proxyMetrics.manifestMetrics.Requests)
+	}
+	if proxyMetrics.manifestMetrics.Hits != 1 {
+		t.Errorf("Expected manifestMetrics.Hits %d but got %d", 1, proxyMetrics.manifestMetrics.Hits)
+	}
+	if proxyMetrics.manifestMetrics.Misses != 1 {
+		t.Errorf("Expected manifestMetrics.Misses %d but got %d", 1, proxyMetrics.manifestMetrics.Misses)
+	}
+	if proxyMetrics.manifestMetrics.BytesPulled != env.manifestSize {
+		t.Errorf("Expected manifestMetrics.BytesPulled %d but got %d", env.manifestSize, proxyMetrics.manifestMetrics.BytesPulled)
+	}
+	if proxyMetrics.manifestMetrics.BytesPushed != (env.manifestSize * 2) {
+		t.Errorf("Expected manifestMetrics.BytesPushed %d but got %d", env.manifestSize*2, proxyMetrics.manifestMetrics.BytesPushed)
 	}
 }

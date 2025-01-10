@@ -14,9 +14,14 @@ import (
 	_ "github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	_ "github.com/distribution/distribution/v3/registry/storage/driver/middleware/cloudfront"
 	_ "github.com/distribution/distribution/v3/registry/storage/driver/middleware/redirect"
+	_ "github.com/distribution/distribution/v3/registry/storage/driver/middleware/rewrite"
 	_ "github.com/distribution/distribution/v3/registry/storage/driver/s3-aws"
 )
 
 func main() {
+	// NOTE(milosgajdos): if the only two commands registered
+	// with registry.RootCmd fail they will halt the program
+	// execution and  exit the program with non-zero exit code.
+	// nolint:errcheck
 	registry.RootCmd.Execute()
 }

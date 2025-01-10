@@ -2,8 +2,10 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -72,6 +74,11 @@ type StorageDriver interface {
 
 	// Writer returns a FileWriter which will store the content written to it
 	// at the location designated by "path" after the call to Commit.
+	// A path may be appended to if it has not been committed, or if the
+	// existing committed content is zero length.
+	//
+	// The behaviour of appending to paths with non-empty committed content is
+	// undefined. Specific implementations may document their own behavior.
 	Writer(ctx context.Context, path string, append bool) (FileWriter, error)
 
 	// Stat retrieves the FileInfo for the given path, including the current
@@ -91,11 +98,10 @@ type StorageDriver interface {
 	// Delete recursively deletes all objects stored at "path" and its subpaths.
 	Delete(ctx context.Context, path string) error
 
-	// URLFor returns a URL which may be used to retrieve the content stored at
-	// the given path, possibly using the given options.
-	// May return an ErrUnsupportedMethod in certain StorageDriver
-	// implementations.
-	URLFor(ctx context.Context, path string, options map[string]interface{}) (string, error)
+	// RedirectURL returns a URL which the client of the request r may use
+	// to retrieve the content stored at path. Returning the empty string
+	// signals that the request may not be redirected.
+	RedirectURL(r *http.Request, path string) (string, error)
 
 	// Walk traverses a filesystem defined within driver, starting
 	// from the given path, calling f on each file.
@@ -122,7 +128,7 @@ type FileWriter interface {
 	// Commit flushes all content written to this FileWriter and makes it
 	// available for future calls to StorageDriver.GetContent and
 	// StorageDriver.Reader.
-	Commit() error
+	Commit(context.Context) error
 }
 
 // PathRegexp is the regular expression which each file path must match. A
@@ -177,11 +183,21 @@ func (err InvalidOffsetError) Error() string {
 // the driver type on which it occurred.
 type Error struct {
 	DriverName string
-	Enclosed   error
+	Detail     error
 }
 
 func (err Error) Error() string {
-	return fmt.Sprintf("%s: %s", err.DriverName, err.Enclosed)
+	return fmt.Sprintf("%s: %s", err.DriverName, err.Detail)
+}
+
+func (err Error) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		DriverName string `json:"driver"`
+		Detail     string `json:"detail"`
+	}{
+		DriverName: err.DriverName,
+		Detail:     err.Detail.Error(),
+	})
 }
 
 // Errors provides the envelope for multiple errors
@@ -196,14 +212,36 @@ var _ error = Errors{}
 func (e Errors) Error() string {
 	switch len(e.Errs) {
 	case 0:
-		return "<nil>"
+		return fmt.Sprintf("%s: <nil>", e.DriverName)
 	case 1:
-		return e.Errs[0].Error()
+		return fmt.Sprintf("%s: %s", e.DriverName, e.Errs[0].Error())
 	default:
 		msg := "errors:\n"
 		for _, err := range e.Errs {
 			msg += err.Error() + "\n"
 		}
-		return msg
+		return fmt.Sprintf("%s: %s", e.DriverName, msg)
 	}
+}
+
+// MarshalJSON converts slice of errors into the format
+// that is serializable by JSON.
+func (e Errors) MarshalJSON() ([]byte, error) {
+	tmpErrs := struct {
+		DriverName string   `json:"driver"`
+		Details    []string `json:"details"`
+	}{
+		DriverName: e.DriverName,
+	}
+
+	if len(e.Errs) == 0 {
+		tmpErrs.Details = make([]string, 0)
+		return json.Marshal(tmpErrs)
+	}
+
+	for _, err := range e.Errs {
+		tmpErrs.Details = append(tmpErrs.Details, err.Error())
+	}
+
+	return json.Marshal(tmpErrs)
 }

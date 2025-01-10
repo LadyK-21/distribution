@@ -37,7 +37,7 @@ WHALE = "+"
 TESTFLAGS_RACE=
 GOFILES=$(shell find . -type f -name '*.go')
 GO_TAGS=$(if $(BUILDTAGS),-tags "$(BUILDTAGS)",)
-GO_LDFLAGS=-ldflags '-extldflags "-Wl,-z,now" -s -w -X $(PKG)/version.Version=$(VERSION) -X $(PKG)/version.Revision=$(REVISION) -X $(PKG)/version.Package=$(PKG) $(EXTRA_LDFLAGS)'
+GO_LDFLAGS=-ldflags '-extldflags "-Wl,-z,now" -s -w -X $(PKG)/version.version=$(VERSION) -X $(PKG)/version.revision=$(REVISION) -X $(PKG)/version.mainpkg=$(PKG) $(EXTRA_LDFLAGS)'
 
 BINARIES=$(addprefix bin/,$(COMMANDS))
 
@@ -45,7 +45,7 @@ BINARIES=$(addprefix bin/,$(COMMANDS))
 TESTFLAGS ?= -v $(TESTFLAGS_RACE)
 TESTFLAGS_PARALLEL ?= 8
 
-.PHONY: all build binaries clean test test-race test-full integration coverage validate lint validate-git validate-vendor vendor mod-outdated image
+.PHONY: all build binaries clean test test-race test-full integration test-coverage validate lint validate-git validate-vendor vendor mod-outdated image validate-authors authors
 .DEFAULT: all
 
 .PHONY: FORCE
@@ -86,6 +86,9 @@ vendor: ## update vendor
 mod-outdated: ## check outdated dependencies
 	docker buildx bake $@
 
+authors: ## generate authors
+	docker buildx bake $@
+
 ##@ Test
 
 test: ## run tests, except integration test with test.short
@@ -104,7 +107,7 @@ integration: ## run integration tests
 	@echo "$(WHALE) $@"
 	@go test ${TESTFLAGS} -parallel ${TESTFLAGS_PARALLEL} ${INTEGRATION_PACKAGE}
 
-coverage: ## generate coverprofiles from the unit tests
+test-coverage: ## run unit tests and generate test coverprofiles
 	@echo "$(WHALE) $@"
 	@rm -f coverage.txt
 	@go test ${GO_TAGS} -i ${TESTFLAGS} $(filter-out ${INTEGRATION_PACKAGE},${COVERAGE_PACKAGES}) 2> /dev/null
@@ -150,6 +153,14 @@ run-s3-tests: start-cloud-storage ## run S3 storage driver integration tests
 	AWS_S3_FORCE_PATH_STYLE=true \
 	go test ${TESTFLAGS} -count=1 ./registry/storage/driver/s3-aws/...
 
+.PHONY: start-e2e-s3-env
+start-e2e-s3-env: ## starts E2E S3 storage test environment (S3, Redis, registry)
+	$(COMPOSE) -f tests/docker-compose-e2e-cloud-storage.yml up -d
+
+.PHONY: stop-e2e-s3-env
+stop-e2e-s3-env: ## stops E2E S3 storage test environment (S3, Redis, registry)
+	$(COMPOSE) -f tests/docker-compose-e2e-cloud-storage.yml down
+
 ##@ Validate
 
 lint: ## run all linters
@@ -162,6 +173,9 @@ validate-git: ## validate git
 	docker buildx bake $@
 
 validate-vendor: ## validate vendor
+	docker buildx bake $@
+
+validate-authors: ## validate authors
 	docker buildx bake $@
 
 .PHONY: help
