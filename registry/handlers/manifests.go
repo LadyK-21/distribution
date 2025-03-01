@@ -6,25 +6,27 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/distribution/distribution/v3"
-	dcontext "github.com/distribution/distribution/v3/context"
+	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/manifest/manifestlist"
 	"github.com/distribution/distribution/v3/manifest/ocischema"
 	"github.com/distribution/distribution/v3/manifest/schema2"
 	"github.com/distribution/distribution/v3/registry/api/errcode"
-	"github.com/distribution/distribution/v3/registry/auth"
+	"github.com/distribution/distribution/v3/registry/storage"
 	"github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/reference"
 	"github.com/gorilla/handlers"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
 	defaultArch         = "amd64"
 	defaultOS           = "linux"
-	maxManifestBodySize = 4 << 20
+	maxManifestBodySize = 4 * 1024 * 1024
 	imageClass          = "image"
 )
 
@@ -213,7 +215,14 @@ func (imh *manifestHandler) GetManifest(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Length", fmt.Sprint(len(p)))
 	w.Header().Set("Docker-Content-Digest", imh.Digest.String())
 	w.Header().Set("Etag", fmt.Sprintf(`"%s"`, imh.Digest))
-	w.Write(p)
+
+	if r.Method == http.MethodHead {
+		return
+	}
+
+	if _, err := w.Write(p); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
 }
 
 func etagMatch(r *http.Request, etag string) bool {
@@ -394,7 +403,7 @@ func (imh *manifestHandler) applyResourcePolicy(manifest distribution.Manifest) 
 		return errcode.ErrorCodeDenied.WithMessage(fmt.Sprintf("registry does not allow %s manifest", class))
 	}
 
-	resources := auth.AuthorizedResources(imh)
+	resources := authorizedResources(imh)
 	n := imh.Repository.Named().Name()
 
 	var foundResource bool
@@ -469,18 +478,32 @@ func (imh *manifestHandler) DeleteManifest(w http.ResponseWriter, r *http.Reques
 	}
 
 	tagService := imh.Repository.Tags(imh)
-	referencedTags, err := tagService.Lookup(imh, distribution.Descriptor{Digest: imh.Digest})
+	referencedTags, err := tagService.Lookup(imh, v1.Descriptor{Digest: imh.Digest})
 	if err != nil {
 		imh.Errors = append(imh.Errors, err)
 		return
 	}
 
+	var (
+		errs []error
+		mu   sync.Mutex
+	)
+	g := errgroup.Group{}
+	g.SetLimit(storage.DefaultConcurrencyLimit)
 	for _, tag := range referencedTags {
-		if err := tagService.Untag(imh, tag); err != nil {
-			imh.Errors = append(imh.Errors, err)
-			return
-		}
+		tag := tag
+
+		g.Go(func() error {
+			if err := tagService.Untag(imh, tag); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+			}
+			return nil
+		})
 	}
+	_ = g.Wait() // imh will record all errors, so ignore the error of Wait()
+	imh.Errors = errs
 
 	w.WriteHeader(http.StatusAccepted)
 }

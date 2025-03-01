@@ -25,7 +25,7 @@ import (
 	"time"
 
 	"github.com/distribution/distribution/v3/configuration"
-	dcontext "github.com/distribution/distribution/v3/context"
+	"github.com/distribution/distribution/v3/internal/dcontext"
 	_ "github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
@@ -103,7 +103,7 @@ func TestGracefulShutdown(t *testing.T) {
 	fmt.Fprintf(conn, "GET /v2/ ")
 
 	// send stop signal
-	quit <- os.Interrupt
+	registry.quit <- os.Interrupt
 	time.Sleep(100 * time.Millisecond)
 
 	// try connecting again. it shouldn't
@@ -219,7 +219,9 @@ func buildRegistryTLSConfig(name, keyType string, cipherSuites []string) (*regis
 		return nil, fmt.Errorf("failed to create certificate: %v", err)
 	}
 	if _, err := os.Stat(os.TempDir()); os.IsNotExist(err) {
-		os.Mkdir(os.TempDir(), 1777)
+		if err := os.Mkdir(os.TempDir(), 1777); err != nil {
+			return nil, fmt.Errorf("failed to create temp dir: %v", err)
+		}
 	}
 
 	certPath := path.Join(os.TempDir(), name+".pem")
@@ -323,7 +325,7 @@ func TestRegistrySupportedCipherSuite(t *testing.T) {
 	}
 
 	// send stop signal
-	quit <- os.Interrupt
+	registry.quit <- os.Interrupt
 	time.Sleep(100 * time.Millisecond)
 }
 
@@ -367,7 +369,7 @@ func TestRegistryUnsupportedCipherSuite(t *testing.T) {
 	}
 
 	// send stop signal
-	quit <- os.Interrupt
+	registry.quit <- os.Interrupt
 	time.Sleep(100 * time.Millisecond)
 }
 

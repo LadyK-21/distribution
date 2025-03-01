@@ -3,11 +3,16 @@ package storage
 import (
 	"context"
 	"regexp"
+	"runtime"
 
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/registry/storage/cache"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/reference"
+)
+
+var (
+	DefaultConcurrencyLimit = runtime.GOMAXPROCS(0)
 )
 
 // registry is the top-level implementation of Registry for use in the storage
@@ -18,10 +23,14 @@ type registry struct {
 	statter                      *blobStatter // global statter service.
 	blobDescriptorCacheProvider  cache.BlobDescriptorCacheProvider
 	deleteEnabled                bool
+	tagLookupConcurrencyLimit    int
 	resumableDigestEnabled       bool
 	blobDescriptorServiceFactory distribution.BlobDescriptorServiceFactory
-	manifestURLs                 manifestURLs
 	driver                       storagedriver.StorageDriver
+
+	// Validation
+	manifestURLs         manifestURLs
+	validateImageIndexes validateImageIndexes
 }
 
 // manifestURLs holds regular expressions for controlling manifest URL whitelisting
@@ -30,14 +39,35 @@ type manifestURLs struct {
 	deny  *regexp.Regexp
 }
 
+// validateImageIndexImages holds configuration for validation of image indexes
+type validateImageIndexes struct {
+	// exist can be used to disable checking that platform images exist entirely. Default true.
+	imagesExist bool
+	// platforms can be used to only validate the existence of images for a set of platforms. The empty array means validate all platforms.
+	imagePlatforms []platform
+}
+
+// platform represents a platform to validate exists in the
+type platform struct {
+	architecture string
+	os           string
+}
+
 // RegistryOption is the type used for functional options for NewRegistry.
 type RegistryOption func(*registry) error
 
 // EnableRedirect is a functional option for NewRegistry. It causes the backend
-// blob server to attempt using (StorageDriver).URLFor to serve all blobs.
+// blob server to attempt using (StorageDriver).RedirectURL to serve all blobs.
 func EnableRedirect(registry *registry) error {
 	registry.blobServer.redirect = true
 	return nil
+}
+
+func TagLookupConcurrencyLimit(concurrencyLimit int) RegistryOption {
+	return func(registry *registry) error {
+		registry.tagLookupConcurrencyLimit = concurrencyLimit
+		return nil
+	}
 }
 
 // EnableDelete is a functional option for NewRegistry. It enables deletion on
@@ -66,6 +96,28 @@ func ManifestURLsAllowRegexp(r *regexp.Regexp) RegistryOption {
 func ManifestURLsDenyRegexp(r *regexp.Regexp) RegistryOption {
 	return func(registry *registry) error {
 		registry.manifestURLs.deny = r
+		return nil
+	}
+}
+
+// EnableValidateImageIndexImagesExist is a functional option for NewRegistry. It enables
+// validation that references exist before an image index is accepted.
+func EnableValidateImageIndexImagesExist(registry *registry) error {
+	registry.validateImageIndexes.imagesExist = true
+	return nil
+}
+
+// AddValidateImageIndexImagesExistPlatform returns a functional option for NewRegistry.
+// It adds a platform to check for existence before an image index is accepted.
+func AddValidateImageIndexImagesExistPlatform(architecture string, os string) RegistryOption {
+	return func(registry *registry) error {
+		registry.validateImageIndexes.imagePlatforms = append(
+			registry.validateImageIndexes.imagePlatforms,
+			platform{
+				architecture: architecture,
+				os:           os,
+			},
+		)
 		return nil
 	}
 }
@@ -102,7 +154,7 @@ func BlobDescriptorCacheProvider(blobDescriptorCacheProvider cache.BlobDescripto
 // NewRegistry creates a new registry instance from the provided driver. The
 // resulting registry may be shared by multiple goroutines but is cheap to
 // allocate. If the Redirect option is specified, the backend blob server will
-// attempt to use (StorageDriver).URLFor to serve all blobs.
+// attempt to use (StorageDriver).RedirectURL to serve all blobs.
 func NewRegistry(ctx context.Context, driver storagedriver.StorageDriver, options ...RegistryOption) (distribution.Namespace, error) {
 	// create global statter
 	statter := &blobStatter{
@@ -184,9 +236,14 @@ func (repo *repository) Named() reference.Named {
 }
 
 func (repo *repository) Tags(ctx context.Context) distribution.TagService {
+	limit := DefaultConcurrencyLimit
+	if repo.tagLookupConcurrencyLimit > 0 {
+		limit = repo.tagLookupConcurrencyLimit
+	}
 	tags := &tagStore{
-		repository: repo,
-		blobStore:  repo.registry.blobStore,
+		repository:       repo,
+		blobStore:        repo.registry.blobStore,
+		concurrencyLimit: limit,
 	}
 
 	return tags
@@ -222,9 +279,10 @@ func (repo *repository) Manifests(ctx context.Context, options ...distribution.M
 	}
 
 	manifestListHandler := &manifestListHandler{
-		ctx:        ctx,
-		repository: repo,
-		blobStore:  blobStore,
+		ctx:                  ctx,
+		repository:           repo,
+		blobStore:            blobStore,
+		validateImageIndexes: repo.validateImageIndexes,
 	}
 
 	ms := &manifestStore{
